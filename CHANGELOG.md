@@ -28,6 +28,8 @@ release will reuse them).
 
 ### Fixed
 
+- macOS clipboard: rich text and images no longer ping-pong between two Macs. Recently received entries are kept out of the send path, and a loop fuse stops a repeated entry if the echo guards are bypassed.
+- macOS: after an app update, MyKVM asks for Accessibility and Input Monitoring again instead of starting with input silently disabled.
 - Remote-desktop sessions: when the controller is itself operated through remote-control software or RDP, the pointer stays on that machine instead of slipping onto a screen the remote operator cannot see. If the pointer was left on another machine, moving the remote mouse brings control back.
 - Layout: a screen you just dragged is no longer snapped back by the background refresh, and the arrow keys move the selected screen.
 - Settings: the port field applies on Enter or when you leave the field instead of on every keystroke.

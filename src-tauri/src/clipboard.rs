@@ -113,6 +113,14 @@ fn clipboard_signature_hash(bytes: &[u8]) -> u64 {
     })
 }
 
+/// Compact, stable label for a clipboard signature, safe for logs and for
+/// long-lived map keys. `Text` signatures embed the whole text (up to 256 KiB),
+/// so using them directly in a log line or a loop-fuse key leaks content and
+/// makes the key needlessly expensive.
+pub(crate) fn signature_digest(signature: &str) -> String {
+    format!("{:016x}", clipboard_signature_hash(signature.as_bytes()))
+}
+
 impl ClipboardContent {
     pub(crate) fn is_oversized(&self) -> bool {
         match self {
@@ -139,9 +147,15 @@ impl ClipboardContent {
     /// suppress echoing content we just received from a peer.
     pub(crate) fn signature(&self) -> String {
         match self {
-            ClipboardContent::Rich(rich) => format!("rich:{:x}:{:x}:{:x}", clipboard_signature_hash(rich.text.as_bytes()),
-                clipboard_signature_hash(rich.html.as_deref().unwrap_or("").as_bytes()),
-                clipboard_signature_hash(rich.rtf.as_deref().unwrap_or(&[]))),
+            // The signature covers the plain text only. macOS and arboard
+            // re-encode the HTML/RTF presentation when a rich copy crosses
+            // the pasteboard, so bytes that left this machine come back
+            // different even though the content is identical. Including
+            // them made every rich copy look fresh and defeated echo
+            // suppression on both ends. (Same text with different
+            // formatting now shares a signature; that is the accepted
+            // cost of a stable identity.)
+            ClipboardContent::Rich(rich) => format!("rich-text:{:016x}", clipboard_signature_hash(rich.text.as_bytes())),
             ClipboardContent::Text(text) => format!("text:{text}"),
             ClipboardContent::Image(image) => {
                 format!(
@@ -286,6 +300,43 @@ mod tests {
         assert_ne!(files_signature(&["ab".into(), "c".into()]), files_signature(&["a".into(), "bc".into()]));
         let text = ClipboardSnapshot::Content(ClipboardContent::Text("same text".into()));
         assert_eq!(text.send_key(Some(1)), text.send_key(Some(2)));
+    }
+
+    #[test]
+    fn rich_signature_ignores_html_rtf_reencoding() {
+        // macOS and arboard re-encode the HTML/RTF presentation when a rich
+        // copy crosses the pasteboard, so bytes that left this machine come
+        // back different even though the content is identical. The signature
+        // must not include them, or every rich copy looks fresh and the echo
+        // guards never fire.
+        let a = ClipboardContent::Rich(crate::rich_clipboard::RichText {
+            text: "hello".into(),
+            html: Some("<b>hello</b>".into()),
+            rtf: Some(vec![1, 2, 3]),
+        });
+        let b = ClipboardContent::Rich(crate::rich_clipboard::RichText {
+            text: "hello".into(),
+            html: Some("<html><body><!--StartFragment-->hello<!--EndFragment--></body></html>".into()),
+            rtf: Some(vec![9, 9, 9, 9]),
+        });
+        let c = ClipboardContent::Rich(crate::rich_clipboard::RichText {
+            text: "goodbye".into(),
+            html: Some("<b>hello</b>".into()),
+            rtf: Some(vec![1, 2, 3]),
+        });
+        assert_eq!(a.signature(), b.signature());
+        assert_ne!(a.signature(), c.signature());
+        assert!(a.signature().starts_with("rich-text:"));
+    }
+
+    #[test]
+    fn signature_digest_is_short_stable_and_does_not_echo_content() {
+        let sample = "text:".to_string() + &"sample clipboard text ".repeat(4096);
+        let digest = signature_digest(&sample);
+        assert_eq!(digest.len(), 16);
+        assert_eq!(digest, signature_digest(&sample.clone()));
+        assert!(!digest.contains("clipboard"));
+        assert_ne!(digest, signature_digest("text:other"));
     }
 
     #[test]

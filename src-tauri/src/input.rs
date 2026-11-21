@@ -1191,6 +1191,36 @@ fn macos_accessibility_trusted(request_permission: bool) -> bool {
     unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) }
 }
 
+/// Reports whether macOS Input Monitoring access is granted. Asking with
+/// `request_permission` shows the system prompt; like the Accessibility grant,
+/// this permission is tied to the signed binary (and is lost after an update
+/// that changes the signature), so prompt again instead of only logging an
+/// error after the event tap fails.
+#[cfg(target_os = "macos")]
+fn macos_input_monitoring_trusted(request_permission: bool) -> bool {
+    static PROMPTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        fn IOHIDCheckAccess(request_type: u32) -> u32;
+        // CF_BOOL is a single byte; read it as u8 and treat any non-zero
+        // value as success instead of relying on a Rust bool ABI.
+        fn IOHIDRequestAccess(request_type: u32) -> u8;
+    }
+
+    const LISTEN_EVENT: u32 = 1;
+    const ACCESS_GRANTED: u32 = 0;
+
+    if unsafe { IOHIDCheckAccess(LISTEN_EVENT) } == ACCESS_GRANTED {
+        return true;
+    }
+    if !request_permission || PROMPTED.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    unsafe { IOHIDRequestAccess(LISTEN_EVENT) != 0 }
+}
+
 /// Reports whether macOS Secure Keyboard Entry is currently enabled by any
 /// process. While it is on, synthetic keyboard events posted via CGEvent are
 /// discarded by the window server (mouse events are unaffected).
@@ -1262,6 +1292,19 @@ fn start_platform_capture(
     let target_count = targets.len();
 
     thread::spawn(move || {
+        // An app update replaces the signed binary, so macOS does not carry
+        // the old Accessibility/Input Monitoring grants over. Ask for both
+        // here, before the event tap silently fails, so the user sees the
+        // system prompt instead of a "connected but no input" app. The
+        // grants require a relaunch to take effect on macOS.
+        let accessibility = macos_accessibility_trusted(true);
+        let input_monitoring = macos_input_monitoring_trusted(true);
+        if !accessibility || !input_monitoring {
+            let _ = ready_tx.send(Err(
+                "macOS 生产包需要单独授权辅助功能和输入监控。请到 系统设置 > 隐私与安全性 > 辅助功能 / 输入监控 启用 MyKVM，然后完全退出并重新打开应用。".into(),
+            ));
+            return;
+        }
         let display_snapshots = mac_display_snapshots();
         // Prepare native cursor data and paired connections outside the event
         // callback, so the first crossing does not pay image decode or dial.
