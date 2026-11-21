@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env, fs,
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, UdpSocket},
@@ -661,6 +661,8 @@ struct AppRuntime {
     clipboard_seen_text: Arc<Mutex<Option<String>>>,
     clipboard_echo_until: Arc<Mutex<Option<Instant>>>,
     clipboard_last_sequences: Arc<Mutex<HashMap<String, u64>>>,
+    clipboard_received_signatures: Arc<Mutex<ClipboardEchoGuard>>,
+    clipboard_loop_fuse: Arc<Mutex<ClipboardLoopFuse>>,
     remote_input_active: Arc<AtomicBool>,
     main_window_visible: Arc<AtomicBool>,
     main_window_focused: Arc<AtomicBool>,
@@ -715,6 +717,8 @@ impl AppRuntime {
             clipboard_seen_text: Arc::new(Mutex::new(None)),
             clipboard_echo_until: Arc::new(Mutex::new(None)),
             clipboard_last_sequences: Arc::new(Mutex::new(HashMap::new())),
+            clipboard_received_signatures: Arc::new(Mutex::new(ClipboardEchoGuard::default())),
+            clipboard_loop_fuse: Arc::new(Mutex::new(ClipboardLoopFuse::new())),
             remote_input_active: Arc::new(AtomicBool::new(false)),
             main_window_visible: Arc::new(AtomicBool::new(false)),
             main_window_focused: Arc::new(AtomicBool::new(false)),
@@ -859,6 +863,8 @@ impl AppRuntime {
         let clipboard_seen_text = Arc::clone(&self.clipboard_seen_text);
         let clipboard_echo_until = Arc::clone(&self.clipboard_echo_until);
         let clipboard_last_sequences = Arc::clone(&self.clipboard_last_sequences);
+        let clipboard_received_signatures = Arc::clone(&self.clipboard_received_signatures);
+        let clipboard_loop_fuse = Arc::clone(&self.clipboard_loop_fuse);
         let clipboard_target = Arc::clone(&self.clipboard_target);
         let app_handle_for_file_transfer = self.app_handle.clone();
         let file_transfers = Arc::clone(&self.file_transfers);
@@ -959,6 +965,8 @@ impl AppRuntime {
                 &clipboard_seen_text,
                 &clipboard_echo_until,
                 &clipboard_last_sequences,
+                &clipboard_received_signatures,
+                &clipboard_loop_fuse,
             ) {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
                 clipboard_packets.fetch_add(1, Ordering::Relaxed);
@@ -1376,6 +1384,8 @@ impl AppRuntime {
         let thread_stop = Arc::clone(&stop);
         let clipboard_seen_text = Arc::clone(&self.clipboard_seen_text);
         let clipboard_echo_until = Arc::clone(&self.clipboard_echo_until);
+        let clipboard_received_signatures = Arc::clone(&self.clipboard_received_signatures);
+        let clipboard_loop_fuse = Arc::clone(&self.clipboard_loop_fuse);
         let clipboard_target = Arc::clone(&self.clipboard_target);
         let transport_packets = Arc::clone(&self.transport_packets);
         let clipboard_packets = Arc::clone(&self.clipboard_packets);
@@ -1394,6 +1404,8 @@ impl AppRuntime {
                 local_peer.id,
                 clipboard_seen_text,
                 clipboard_echo_until,
+                clipboard_received_signatures,
+                clipboard_loop_fuse,
                 clipboard_target,
                 transport_packets,
                 clipboard_packets,
@@ -6620,11 +6632,226 @@ fn clipboard_retry_delay(failures: u32) -> Duration {
     Duration::from_millis((CLIPBOARD_RETRY_INTERVAL_MS << doublings).min(CLIPBOARD_RETRY_MAX_MS))
 }
 
+/// Loop fuse for the clipboard channel. The same entry repeating from
+/// the same peer (or to the same target) inside a short window means
+/// the echo guards failed and the two machines are ping-ponging one
+/// clipboard entry. Once the fuse trips, that entry is left alone
+/// until the cooldown expires, so a storm can never fill the
+/// pasteboard history again. Different entries and different peers
+/// are unaffected: only repeats of one key count.
+const CLIPBOARD_LOOP_FUSE_MAX_REPEATS: u32 = 5;
+const CLIPBOARD_LOOP_FUSE_WINDOW: Duration = Duration::from_secs(60);
+const CLIPBOARD_LOOP_FUSE_COOLDOWN: Duration = Duration::from_secs(300);
+// Keys are hashed signatures, but a long-running session can still see
+// thousands of distinct clipboard entries. Bound the bookkeeping so a fuse
+// that is never consulted again cannot grow without limit.
+const CLIPBOARD_LOOP_FUSE_MAX_KEYS: usize = 256;
+
+#[derive(Default)]
+struct ClipboardLoopFuse {
+    events: HashMap<String, VecDeque<Instant>>,
+    blocked_until: HashMap<String, Instant>,
+    max_repeats: u32,
+    window: Duration,
+    cooldown: Duration,
+}
+
+impl ClipboardLoopFuse {
+    fn new() -> Self {
+        Self {
+            events: HashMap::new(),
+            blocked_until: HashMap::new(),
+            max_repeats: CLIPBOARD_LOOP_FUSE_MAX_REPEATS,
+            window: CLIPBOARD_LOOP_FUSE_WINDOW,
+            cooldown: CLIPBOARD_LOOP_FUSE_COOLDOWN,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limits(max_repeats: u32, window: Duration, cooldown: Duration) -> Self {
+        Self {
+            events: HashMap::new(),
+            blocked_until: HashMap::new(),
+            max_repeats,
+            window,
+            cooldown,
+        }
+    }
+
+    /// True when `key` is still cooling down after a trip: the caller
+    /// must drop the event without counting it.
+    fn is_blocked(&mut self, key: &str, now: Instant) -> bool {
+        if let Some(until) = self.blocked_until.get(key) {
+            if now < *until {
+                return true;
+            }
+            self.blocked_until.remove(key);
+        }
+        false
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.events.retain(|_, events| {
+            while events.front().is_some_and(|first| {
+                now.saturating_duration_since(*first) > self.window
+            }) {
+                events.pop_front();
+            }
+            !events.is_empty()
+        });
+        self.blocked_until.retain(|_, until| now < *until);
+        while self.events.len() > CLIPBOARD_LOOP_FUSE_MAX_KEYS {
+            let Some(oldest) = self
+                .events
+                .iter()
+                .min_by_key(|(_, events)| events.back().copied())
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.events.remove(&oldest);
+        }
+        while self.blocked_until.len() > CLIPBOARD_LOOP_FUSE_MAX_KEYS {
+            let Some(oldest) = self
+                .blocked_until
+                .iter()
+                .min_by_key(|(_, until)| **until)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.blocked_until.remove(&oldest);
+        }
+    }
+
+    /// Record one completed send/receive of `key` (which already names
+    /// the direction, peer and signature). Returns false when this
+    /// event trips the fuse: the key is now cooling down.
+    fn note(&mut self, key: &str, now: Instant) -> bool {
+        self.prune(now);
+        let events = self.events.entry(key.to_string()).or_default();
+        while events.front().is_some_and(|first| {
+            now.saturating_duration_since(*first) > self.window
+        }) {
+            events.pop_front();
+        }
+        events.push_back(now);
+        if events.len() as u32 >= self.max_repeats {
+            self.blocked_until
+                .insert(key.to_string(), now + self.cooldown);
+            events.clear();
+            self.prune(now);
+            return false;
+        }
+        self.prune(now);
+        true
+    }
+}
+
+const CLIPBOARD_ECHO_HISTORY: usize = 8;
+const CLIPBOARD_ECHO_TTL: Duration = Duration::from_secs(60);
+const CLIPBOARD_ECHO_MAX_PEERS: usize = 64;
+
+/// Recently received signature digests, per peer identity. Remembering only
+/// the last signature loses the echo guard when two packets arrive back-to-back
+/// (A then B): a slow clipboard poll can still observe A afterwards, see that
+/// the stored signature is B, and send A back to the peer. Keep a small
+/// bounded history instead so every recently received entry is suppressed.
+/// Digests are stored rather than the full signatures: `Text` signatures embed
+/// up to 256 KiB of clipboard content, and a per-peer history would otherwise
+/// retain many copies of it.
+#[derive(Default)]
+struct ClipboardEchoGuard {
+    entries: HashMap<String, VecDeque<(String, Instant)>>,
+}
+
+impl ClipboardEchoGuard {
+    fn remember(&mut self, peer: &str, signature_digest: &str, now: Instant) {
+        let peer = peer.trim();
+        if peer.is_empty() || signature_digest.is_empty() {
+            return;
+        }
+        self.prune(now);
+        let queue = self.entries.entry(peer.to_string()).or_default();
+        if let Some(index) = queue
+            .iter()
+            .position(|(existing, _)| existing == signature_digest)
+        {
+            queue.remove(index);
+        }
+        queue.push_back((signature_digest.to_string(), now));
+        while queue.len() > CLIPBOARD_ECHO_HISTORY {
+            queue.pop_front();
+        }
+        while self.entries.len() > CLIPBOARD_ECHO_MAX_PEERS {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, queue)| queue.back().map(|(_, at)| *at))
+                .map(|(peer, _)| peer.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn is_echo(&self, peer: &str, signature_digest: &str, now: Instant) -> bool {
+        let peer = peer.trim();
+        if peer.is_empty() {
+            return false;
+        }
+        self.entries.get(peer).is_some_and(|queue| {
+            queue.iter().any(|(existing, at)| {
+                existing == signature_digest
+                    && now.saturating_duration_since(*at) <= CLIPBOARD_ECHO_TTL
+            })
+        })
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.entries.retain(|_, queue| {
+            while queue.front().is_some_and(|(_, at)| {
+                now.saturating_duration_since(*at) > CLIPBOARD_ECHO_TTL
+            }) {
+                queue.pop_front();
+            }
+            !queue.is_empty()
+        });
+    }
+
+    #[cfg(test)]
+    fn last_digest(&self, peer: &str) -> Option<&str> {
+        self.entries
+            .get(peer)
+            .and_then(|queue| queue.back())
+            .map(|(digest, _)| digest.as_str())
+    }
+}
+
+/// True when `signature_digest` was recently received from this peer: it must
+/// never be sent back. The guard is keyed by peer id and by the stable
+/// transport public key, so it holds when the peer id changes (DHCP
+/// renumber) or the target was learned from a packet with no device id.
+fn clipboard_is_echo_for_target(
+    received: &ClipboardEchoGuard,
+    device_id: &str,
+    transport_public_key: &str,
+    signature_digest: &str,
+    now: Instant,
+) -> bool {
+    received.is_echo(device_id, signature_digest, now)
+        || (!transport_public_key.trim().is_empty()
+            && received.is_echo(transport_public_key, signature_digest, now))
+}
+
 fn run_clipboard_sync(
     quic_transport: quic_transport::TransportHandle,
     local_peer_id: String,
     clipboard_seen_text: Arc<Mutex<Option<String>>>,
     clipboard_echo_until: Arc<Mutex<Option<Instant>>>,
+    clipboard_received_signatures: Arc<Mutex<ClipboardEchoGuard>>,
+    clipboard_loop_fuse: Arc<Mutex<ClipboardLoopFuse>>,
     clipboard_target: Arc<Mutex<Option<input::ClipboardTarget>>>,
     transport_packets: Arc<AtomicU64>,
     clipboard_packets: Arc<AtomicU64>,
@@ -6698,6 +6925,7 @@ fn run_clipboard_sync(
             .filter(|version| Some(*version) == clipboard::change_count())
             .map(|version| (version, target.device_id.clone(), target.addr.clone()));
         let signature = content.signature();
+        let signature_digest = crate::clipboard::signature_digest(&signature);
         let send_key = content.send_key(version);
         let is_files = matches!(&content, clipboard::ClipboardSnapshot::Files(_));
 
@@ -6761,6 +6989,46 @@ fn run_clipboard_sync(
             .unwrap_or(true);
 
         if !should_send {
+            last_failed = None;
+            last_sent = Some((target.device_id.clone(), target.addr.clone(), send_key));
+            continue;
+        }
+
+        // Never send content back to the peer it came from: without this,
+        // two machines holding the same clipboard entry keep handing it
+        // to each other forever. The received map is keyed by peer id and
+        // transport key, so the guard holds even when the peer id changes.
+        if clipboard_received_signatures
+            .lock()
+            .map(|received| {
+                clipboard_is_echo_for_target(
+                    &received,
+                    &target.device_id,
+                    &target.transport_public_key,
+                    &signature_digest,
+                    Instant::now(),
+                )
+            })
+            .unwrap_or(false)
+        {
+            log::debug!("clipboard send suppressed: echo to {} signature {}", target.device_id, signature_digest);
+            last_failed = None;
+            last_sent = Some((target.device_id.clone(), target.addr.clone(), send_key));
+            continue;
+        }
+
+        // Loop fuse: the same entry sent to the same target over and over
+        // inside a minute means the echo guards failed somewhere. A fused
+        // entry is left alone until the cooldown expires. Only completed
+        // sends count towards a trip, so retries to a down peer never
+        // fuse an entry on their own.
+        let fuse_key = format!("send:{}:{}", target.device_id, signature_digest);
+        if clipboard_loop_fuse
+            .lock()
+            .map(|mut fuse| fuse.is_blocked(&fuse_key, Instant::now()))
+            .unwrap_or(false)
+        {
+            log::debug!("clipboard loop fuse: not sending to {} signature {}", target.device_id, signature_digest);
             last_failed = None;
             last_sent = Some((target.device_id.clone(), target.addr.clone(), send_key));
             continue;
@@ -6849,6 +7117,14 @@ fn run_clipboard_sync(
             }
             last_failed = None;
             last_sent = Some((target.device_id, target.addr, send_key));
+            if !clipboard_loop_fuse
+                .lock()
+                .map(|mut fuse| fuse.note(&fuse_key, Instant::now()))
+                .unwrap_or(true)
+            {
+                log::warn!("clipboard loop fuse tripped for signature {signature_digest}; further sends of this entry are suppressed for {}s", CLIPBOARD_LOOP_FUSE_COOLDOWN.as_secs());
+            }
+            log::debug!("clipboard sent signature {signature_digest}");
         } else {
             let error = send_result.err().unwrap_or_default();
             if error == CLIPBOARD_FILES_SUPERSEDED || error == "传输已取消。" {
@@ -6985,6 +7261,8 @@ fn handle_clipboard_packet(
     clipboard_seen_text: &Arc<Mutex<Option<String>>>,
     clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
     clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
+    clipboard_received_signatures: &Arc<Mutex<ClipboardEchoGuard>>,
+    clipboard_loop_fuse: &Arc<Mutex<ClipboardLoopFuse>>,
 ) -> bool {
     let accepted = handle_clipboard_packet_with_writer(
         payload,
@@ -6993,7 +7271,29 @@ fn handle_clipboard_packet(
         clipboard_seen_text,
         clipboard_echo_until,
         clipboard_last_sequences,
+        clipboard_received_signatures,
+        clipboard_loop_fuse,
         write_clipboard_content_with_retry,
+        |content| {
+            // Images are the only content whose bytes can drift on a
+            // pasteboard round-trip (colour profile / premultiplied
+            // alpha), so only for images do we read the pasteboard back
+            // and record what is actually there now. The dimensions must
+            // match what was written, so a fresh copy racing the read is
+            // never adopted as this packet's signature.
+            if let ClipboardContent::Image(image) = content {
+                clipboard::read_snapshot().and_then(|snapshot| match snapshot {
+                    clipboard::ClipboardSnapshot::Content(ClipboardContent::Image(back))
+                        if back.width == image.width && back.height == image.height =>
+                    {
+                        Some(ClipboardContent::Image(back).signature())
+                    }
+                    _ => None,
+                })
+            } else {
+                None
+            }
+        },
     );
     if accepted {
         #[derive(Deserialize)]
@@ -7009,17 +7309,21 @@ fn handle_clipboard_packet(
     accepted
 }
 
-fn handle_clipboard_packet_with_writer<F>(
+fn handle_clipboard_packet_with_writer<F, G>(
     payload: &[u8],
     layout: &LayoutState,
     local_peer_id: &str,
     clipboard_seen_text: &Arc<Mutex<Option<String>>>,
     clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
     clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
+    clipboard_received_signatures: &Arc<Mutex<ClipboardEchoGuard>>,
+    clipboard_loop_fuse: &Arc<Mutex<ClipboardLoopFuse>>,
     mut write_content: F,
+    read_back_signature: G,
 ) -> bool
 where
     F: FnMut(&ClipboardContent) -> Result<(), String>,
+    G: Fn(&ClipboardContent) -> Option<String>,
 {
     let Some(packet) = decode_wire_packet::<ClipboardPacket>(payload) else {
         return false;
@@ -7046,6 +7350,8 @@ where
     }
 
     let accepted_sequence = clipboard_packet_sequence(&packet);
+    let origin_id = packet.origin_id.clone();
+    let origin_transport_public_key = packet.origin_transport_public_key.clone();
     let content = clipboard_content_from_packet(packet);
 
     let Some(content) = content else {
@@ -7056,6 +7362,22 @@ where
     }
 
     let signature = content.signature();
+    let signature_digest = crate::clipboard::signature_digest(&signature);
+    // Loop fuse: the same entry arriving from the same peer over and over
+    // inside a minute means the echo guards failed somewhere. A fused
+    // entry is dropped before it touches the pasteboard again. Only
+    // completed writes count towards a trip, so a failing pasteboard
+    // never fuses an entry on its own.
+    let fuse_key = format!("recv:{origin_id}:{signature_digest}");
+    if clipboard_loop_fuse
+        .lock()
+        .map(|mut fuse| fuse.is_blocked(&fuse_key, Instant::now()))
+        .unwrap_or(false)
+    {
+        log::warn!("clipboard loop fuse: dropping receive from {origin_id} signature {signature_digest}");
+        return false;
+    }
+
     let written = match write_content(&content) {
         Ok(()) => true,
         Err(error) => {
@@ -7068,13 +7390,39 @@ where
         if let Some((origin_id, sequence)) = accepted_sequence {
             remember_clipboard_packet_sequence(clipboard_last_sequences, origin_id, sequence);
         }
-        // Remember what we just wrote so our own poll loop recognizes it as an
-        // echo (signature match) and arm the time-based guard as a backstop in
-        // case the OS hands the bitmap back to us with slightly different bytes.
-        if let Ok(mut seen) = clipboard_seen_text.lock() {
-            *seen = Some(signature);
+        if !clipboard_loop_fuse
+            .lock()
+            .map(|mut fuse| fuse.note(&fuse_key, Instant::now()))
+            .unwrap_or(true)
+        {
+            log::warn!("clipboard loop fuse tripped for origin {origin_id} signature {signature_digest}; further receives of this entry are suppressed for {}s", CLIPBOARD_LOOP_FUSE_COOLDOWN.as_secs());
         }
+        // Record what is actually on the pasteboard now, not what the wire
+        // claimed: for images the OS may re-encode pixels on write, and
+        // the read-back signature is the one our poll loop will see next.
+        // The read-back only ever replaces the signature for an image
+        // whose dimensions match what was written.
+        let effective_signature = read_back_signature(&content).unwrap_or_else(|| signature.clone());
+        let effective_signature_digest =
+            crate::clipboard::signature_digest(&effective_signature);
+        if let Ok(mut seen) = clipboard_seen_text.lock() {
+            *seen = Some(effective_signature.clone());
+        }
+        // Remember what we just wrote, per origin, so our send loop never
+        // hands it back to the peer it came from. Keyed by peer id and by
+        // the stable transport public key, so the guard also holds when
+        // the peer id changes (DHCP renumber). A short history is kept per
+        // peer: a second packet arriving before the clipboard poll catches
+        // up must not hide the first entry from the echo guard.
+        if let Ok(mut received) = clipboard_received_signatures.lock() {
+            let now = Instant::now();
+            received.remember(&origin_id, &effective_signature_digest, now);
+            received.remember(&origin_transport_public_key, &effective_signature_digest, now);
+        }
+        // Arm the time-based guard as a backstop: our own poll loop
+        // recognizes the written content as an echo by signature match.
         arm_clipboard_echo_guard(clipboard_echo_until);
+        log::info!("clipboard received from {origin_id} signature {effective_signature_digest}");
     }
 
     written
@@ -11631,6 +11979,8 @@ mod tests {
         let clipboard_seen_text = Arc::new(Mutex::new(None));
         let clipboard_echo_until = Arc::new(Mutex::new(None));
         let clipboard_last_sequences = Arc::new(Mutex::new(HashMap::new()));
+        let clipboard_received_signatures = Arc::new(Mutex::new(ClipboardEchoGuard::default()));
+        let clipboard_loop_fuse = Arc::new(Mutex::new(ClipboardLoopFuse::new()));
         let mut written = None;
 
         let accepted = handle_clipboard_packet_with_writer(
@@ -11640,12 +11990,15 @@ mod tests {
             &clipboard_seen_text,
             &clipboard_echo_until,
             &clipboard_last_sequences,
+            &clipboard_received_signatures,
+            &clipboard_loop_fuse,
             |content| {
                 if let ClipboardContent::Text(text) = content {
                     written = Some(text.clone());
                 }
                 Ok(())
             },
+            |_| None,
         );
 
         assert!(accepted);
@@ -11672,6 +12025,8 @@ mod tests {
         let clipboard_seen_text = Arc::new(Mutex::new(None));
         let clipboard_echo_until = Arc::new(Mutex::new(None));
         let clipboard_last_sequences = Arc::new(Mutex::new(HashMap::new()));
+        let clipboard_received_signatures = Arc::new(Mutex::new(ClipboardEchoGuard::default()));
+        let clipboard_loop_fuse = Arc::new(Mutex::new(ClipboardLoopFuse::new()));
         let mut written = None;
 
         let accepted = handle_clipboard_packet_with_writer(
@@ -11681,12 +12036,15 @@ mod tests {
             &clipboard_seen_text,
             &clipboard_echo_until,
             &clipboard_last_sequences,
+            &clipboard_received_signatures,
+            &clipboard_loop_fuse,
             |content| {
                 if let ClipboardContent::Text(text) = content {
                     written = Some(text.clone());
                 }
                 Ok(())
             },
+            |_| None,
         );
 
         assert!(accepted);
@@ -11718,6 +12076,8 @@ mod tests {
         let clipboard_seen_text = Arc::new(Mutex::new(None));
         let clipboard_echo_until = Arc::new(Mutex::new(None));
         let clipboard_last_sequences = Arc::new(Mutex::new(HashMap::new()));
+        let clipboard_received_signatures = Arc::new(Mutex::new(ClipboardEchoGuard::default()));
+        let clipboard_loop_fuse = Arc::new(Mutex::new(ClipboardLoopFuse::new()));
         let mut written = None;
 
         let accepted = handle_clipboard_packet_with_writer(
@@ -11727,12 +12087,15 @@ mod tests {
             &clipboard_seen_text,
             &clipboard_echo_until,
             &clipboard_last_sequences,
+            &clipboard_received_signatures,
+            &clipboard_loop_fuse,
             |content| {
                 if let ClipboardContent::Text(text) = content {
                     written = Some(text.clone());
                 }
                 Ok(())
             },
+            |_| None,
         );
 
         assert!(accepted);
@@ -11745,6 +12108,8 @@ mod tests {
         let clipboard_seen_text = Arc::new(Mutex::new(None));
         let clipboard_echo_until = Arc::new(Mutex::new(None));
         let clipboard_last_sequences = Arc::new(Mutex::new(HashMap::new()));
+        let clipboard_received_signatures = Arc::new(Mutex::new(ClipboardEchoGuard::default()));
+        let clipboard_loop_fuse = Arc::new(Mutex::new(ClipboardLoopFuse::new()));
         let mut written = Vec::new();
 
         let first = clipboard_packet_from_content(
@@ -11775,12 +12140,15 @@ mod tests {
                 &clipboard_seen_text,
                 &clipboard_echo_until,
                 &clipboard_last_sequences,
+                &clipboard_received_signatures,
+                &clipboard_loop_fuse,
                 |content| {
                     if let ClipboardContent::Text(text) = content {
                         written.push(text.clone());
                     }
                     Ok(())
                 },
+                |_| None,
             );
         }
 
@@ -11803,6 +12171,8 @@ mod tests {
         let clipboard_seen_text = Arc::new(Mutex::new(None));
         let clipboard_echo_until = Arc::new(Mutex::new(None));
         let clipboard_last_sequences = Arc::new(Mutex::new(HashMap::new()));
+        let clipboard_received_signatures = Arc::new(Mutex::new(ClipboardEchoGuard::default()));
+        let clipboard_loop_fuse = Arc::new(Mutex::new(ClipboardLoopFuse::new()));
 
         let accepted = handle_clipboard_packet_with_writer(
             &payload,
@@ -11811,11 +12181,251 @@ mod tests {
             &clipboard_seen_text,
             &clipboard_echo_until,
             &clipboard_last_sequences,
+            &clipboard_received_signatures,
+            &clipboard_loop_fuse,
             |_| Err("clipboard busy".into()),
+            |_| None,
         );
 
         assert!(!accepted);
         assert!(clipboard_seen_text.lock().expect("seen lock").is_none());
+    }
+
+    #[test]
+    fn clipboard_loop_fuse_trips_on_repeated_same_signature() {
+        let mut fuse = ClipboardLoopFuse::with_limits(
+            5,
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+        );
+        let now = Instant::now();
+        for _ in 0..4 {
+            assert!(fuse.note("send:peer:text:hello", now));
+        }
+        assert!(!fuse.note("send:peer:text:hello", now));
+        assert!(fuse.is_blocked("send:peer:text:hello", now));
+        assert!(!fuse.is_blocked("send:other:text:hello", now));
+        assert!(fuse.note("send:other:text:hello", now));
+        assert!(fuse.note("send:peer:text:other", now));
+    }
+
+    #[test]
+    fn clipboard_loop_fuse_cools_down_and_allows_again() {
+        let mut fuse = ClipboardLoopFuse::with_limits(
+            2,
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+        );
+        let now = Instant::now();
+        assert!(fuse.note("k", now));
+        assert!(!fuse.note("k", now));
+        assert!(fuse.is_blocked("k", now));
+        std::thread::sleep(Duration::from_millis(150));
+        let later = Instant::now();
+        assert!(!fuse.is_blocked("k", later));
+        assert!(fuse.note("k", later));
+    }
+
+    #[test]
+    fn clipboard_loop_fuse_prunes_and_bounds_bookkeeping() {
+        let now = Instant::now();
+        let mut fuse = ClipboardLoopFuse::with_limits(
+            5,
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        );
+        for index in 0..(CLIPBOARD_LOOP_FUSE_MAX_KEYS + 32) {
+            fuse.note(&format!("send:peer:{index}"), now);
+        }
+        assert!(fuse.events.len() <= CLIPBOARD_LOOP_FUSE_MAX_KEYS);
+
+        std::thread::sleep(Duration::from_millis(30));
+        fuse.note("send:peer:after-expiry", Instant::now());
+        assert!(fuse.events.len() <= CLIPBOARD_LOOP_FUSE_MAX_KEYS);
+
+        let now = Instant::now();
+        let mut fuse = ClipboardLoopFuse::with_limits(
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        for index in 0..(CLIPBOARD_LOOP_FUSE_MAX_KEYS + 32) {
+            fuse.note(&format!("send:peer:{index}"), now);
+        }
+        assert!(fuse.blocked_until.len() <= CLIPBOARD_LOOP_FUSE_MAX_KEYS);
+    }
+
+    #[test]
+    fn clipboard_is_echo_for_target_matches_peer_id_and_transport_key() {
+        let mut received = ClipboardEchoGuard::default();
+        let now = Instant::now();
+        let hello = crate::clipboard::signature_digest("text:hello");
+        let other = crate::clipboard::signature_digest("text:other");
+        let second = crate::clipboard::signature_digest("text:second");
+        received.remember("peer-a", &hello, now);
+        received.remember("key-a", &hello, now);
+        assert!(clipboard_is_echo_for_target(&received, "peer-a", "key-a", &hello, now));
+        // Peer id changed (DHCP renumber) but the transport key is stable.
+        assert!(clipboard_is_echo_for_target(&received, "peer-renumbered", "key-a", &hello, now));
+        assert!(!clipboard_is_echo_for_target(&received, "peer-a", "key-a", &other, now));
+        assert!(!clipboard_is_echo_for_target(&received, "peer-b", "key-b", &hello, now));
+        assert!(!clipboard_is_echo_for_target(&received, "peer-b", "", &hello, now));
+
+        // A second packet can arrive before the clipboard poll observes the
+        // first one. Keeping only the latest signature would let `hello`
+        // echo back to the peer; the bounded history keeps both suppressed.
+        received.remember("peer-a", &second, now);
+        received.remember("key-a", &second, now);
+        assert!(clipboard_is_echo_for_target(&received, "peer-a", "key-a", &hello, now));
+        assert!(clipboard_is_echo_for_target(&received, "peer-a", "key-a", &second, now));
+    }
+
+    #[test]
+    fn clipboard_received_content_is_recorded_per_origin() {
+        let layout = test_layout();
+        let packet = clipboard_packet_from_content(
+            ClipboardContent::Text("hello".into()),
+            "peer-client-10-0-0-2".into(),
+            "peer-public-key".into(),
+            "local-device".into(),
+            layout.cluster_id.clone(),
+            layout.pair_secret.clone(),
+            1,
+        );
+        let payload = encode_wire_packet(&packet).expect("clipboard packet should encode");
+        let clipboard_seen_text = Arc::new(Mutex::new(None));
+        let clipboard_echo_until = Arc::new(Mutex::new(None));
+        let clipboard_last_sequences = Arc::new(Mutex::new(HashMap::new()));
+        let clipboard_received_signatures = Arc::new(Mutex::new(ClipboardEchoGuard::default()));
+        let clipboard_loop_fuse = Arc::new(Mutex::new(ClipboardLoopFuse::new()));
+
+        let accepted = handle_clipboard_packet_with_writer(
+            &payload,
+            &layout,
+            "local-device",
+            &clipboard_seen_text,
+            &clipboard_echo_until,
+            &clipboard_last_sequences,
+            &clipboard_received_signatures,
+            &clipboard_loop_fuse,
+            |_| Ok(()),
+            |_| None,
+        );
+
+        assert!(accepted);
+        let received = clipboard_received_signatures
+            .lock()
+            .expect("received lock");
+        let expected = crate::clipboard::signature_digest("text:hello");
+        assert_eq!(
+            received.last_digest("peer-client-10-0-0-2"),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            received.last_digest("peer-public-key"),
+            Some(expected.as_str())
+        );
+        assert!(clipboard_is_echo_for_target(
+            &received,
+            "peer-client-10-0-0-2",
+            "peer-public-key",
+            &expected,
+            Instant::now()
+        ));
+    }
+
+    #[test]
+    fn clipboard_write_readback_signature_is_recorded_when_pixels_drift() {
+        let layout = test_layout();
+        let packet = clipboard_packet_from_content(
+            ClipboardContent::Image(ClipboardImage {
+                width: 2,
+                height: 2,
+                rgba_base64: "AAAAAAAAAAAAAAAAAAAAAA==".into(),
+            }),
+            "peer-client-10-0-0-2".into(),
+            String::new(),
+            "local-device".into(),
+            layout.cluster_id.clone(),
+            layout.pair_secret.clone(),
+            1,
+        );
+        let payload = encode_wire_packet(&packet).expect("clipboard packet should encode");
+        let clipboard_seen_text = Arc::new(Mutex::new(None));
+        let clipboard_echo_until = Arc::new(Mutex::new(None));
+        let clipboard_last_sequences = Arc::new(Mutex::new(HashMap::new()));
+        let clipboard_received_signatures = Arc::new(Mutex::new(ClipboardEchoGuard::default()));
+        let clipboard_loop_fuse = Arc::new(Mutex::new(ClipboardLoopFuse::new()));
+
+        let accepted = handle_clipboard_packet_with_writer(
+            &payload,
+            &layout,
+            "local-device",
+            &clipboard_seen_text,
+            &clipboard_echo_until,
+            &clipboard_last_sequences,
+            &clipboard_received_signatures,
+            &clipboard_loop_fuse,
+            |_| Ok(()),
+            |_| Some("image:2x2:32:deadbeef".into()),
+        );
+
+        assert!(accepted);
+        assert_eq!(
+            clipboard_seen_text.lock().expect("seen lock").as_deref(),
+            Some("image:2x2:32:deadbeef")
+        );
+        let expected = crate::clipboard::signature_digest("image:2x2:32:deadbeef");
+        assert_eq!(
+            clipboard_received_signatures
+                .lock()
+                .expect("received lock")
+                .last_digest("peer-client-10-0-0-2"),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn clipboard_loop_fuse_drops_repeated_receives() {
+        let layout = test_layout();
+        let seen = Arc::new(Mutex::new(None));
+        let echo = Arc::new(Mutex::new(None));
+        let sequences = Arc::new(Mutex::new(HashMap::new()));
+        let received = Arc::new(Mutex::new(ClipboardEchoGuard::default()));
+        let fuse = Arc::new(Mutex::new(ClipboardLoopFuse::new()));
+        let mut writes = 0;
+        for sequence in 1..=6u64 {
+            let packet = clipboard_packet_from_content(
+                ClipboardContent::Text("loop".into()),
+                "peer-client-10-0-0-2".into(),
+                String::new(),
+                "local-device".into(),
+                layout.cluster_id.clone(),
+                layout.pair_secret.clone(),
+                sequence,
+            );
+            let accepted = handle_clipboard_packet_with_writer(
+                &encode_wire_packet(&packet).unwrap(),
+                &layout,
+                "local-device",
+                &seen,
+                &echo,
+                &sequences,
+                &received,
+                &fuse,
+                |_| {
+                    writes += 1;
+                    Ok(())
+                },
+                |_| None,
+            );
+            if sequence <= 5 {
+                assert!(accepted, "sequence {sequence} should be accepted");
+            } else {
+                assert!(!accepted, "sequence {sequence} should be dropped by the loop fuse");
+            }
+        }
+        assert_eq!(writes, 5);
     }
 
     #[test]
@@ -12169,14 +12779,14 @@ mod tests {
         layout.clipboard_on_demand = true;
         let mut packet = clipboard_packet_from_content(ClipboardContent::Text("remote".into()), "peer".into(), "key".into(),
             "local-device".into(), layout.cluster_id.clone(), layout.pair_secret.clone(), 1);
-        let seen = Arc::new(Mutex::new(None)); let echo = Arc::new(Mutex::new(None)); let sequences = Arc::new(Mutex::new(HashMap::new()));
+        let seen = Arc::new(Mutex::new(None)); let echo = Arc::new(Mutex::new(None)); let sequences = Arc::new(Mutex::new(HashMap::new())); let received = Arc::new(Mutex::new(ClipboardEchoGuard::default())); let fuse = Arc::new(Mutex::new(ClipboardLoopFuse::new()));
         let mut writes = 0;
-        assert!(!handle_clipboard_packet_with_writer(&encode_wire_packet(&packet).unwrap(), &layout, "local-device", &seen, &echo, &sequences, |_| { writes += 1; Ok(()) }));
+        assert!(!handle_clipboard_packet_with_writer(&encode_wire_packet(&packet).unwrap(), &layout, "local-device", &seen, &echo, &sequences, &received, &fuse, |_| { writes += 1; Ok(()) }, |_| None));
         packet.paste = true;
-        assert!(!handle_clipboard_packet_with_writer(&encode_wire_packet(&packet).unwrap(), &layout, "local-device", &seen, &echo, &sequences, |_| { writes += 1; Ok(()) }));
+        assert!(!handle_clipboard_packet_with_writer(&encode_wire_packet(&packet).unwrap(), &layout, "local-device", &seen, &echo, &sequences, &received, &fuse, |_| { writes += 1; Ok(()) }, |_| None));
         assert_eq!(writes, 0);
         packet.paste_token = clipboard_exchange::expect_paste("key");
-        assert!(handle_clipboard_packet_with_writer(&encode_wire_packet(&packet).unwrap(), &layout, "local-device", &seen, &echo, &sequences, |_| { writes += 1; Ok(()) }));
+        assert!(handle_clipboard_packet_with_writer(&encode_wire_packet(&packet).unwrap(), &layout, "local-device", &seen, &echo, &sequences, &received, &fuse, |_| { writes += 1; Ok(()) }, |_| None));
         assert_eq!(writes, 1);
     }
 
